@@ -1,1 +1,239 @@
-范德af萨发范德萨发
+# WebSocket 服务说明
+
+配置：`config/process.php` → `Websocket`
+
+## 连接信息
+
+| 项 | 说明 |
+|---|---|
+| 地址 | `ws://{host}:2233` |
+| 协议 | WebSocket（Workerman） |
+| 数据格式 | JSON 文本 |
+
+## 数据流向
+
+```
+客户端连接
+  ├─ 立即收到 1 次「状态广播」
+  ├─ 之后每 1 秒收到「状态广播」（服务端主动推送）
+  └─ 客户端可发送「控制指令」，服务端单独应答 ok / error
+
+任务定时器（taskTimerStart）运行中
+  └─ 每 3 秒检测上一任务是否结束，满足条件则自动创建新导航任务
+      异常时向所有连接广播 error
+```
+
+---
+
+## 一、服务端广播（每 1 秒）
+
+连接成功时立即推送一次，之后定时广播。所有已连接客户端收到相同内容。
+
+### 根字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `time` | int | 服务端组装数据时的 Unix 时间戳（秒） |
+| `task` | object \| null | 最后一条自动驾驶任务及关联数据；无任务时为 `null` |
+| `error_codes` | array | 最近 10 条错误码记录，按 `id` 倒序 |
+| `point` | object \| null | 车辆最新定位；无定位时为 `null` |
+
+### `task` 对象
+
+来源表：`robot_auto_driving_task`，并关联 `auto_driving_task_execution`、`auto_driving_task_response`。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | int | 任务主键 |
+| `mqtt_id` | int | 关联 MQTT 消息 ID，无则为 `0` |
+| `start_lng` | string | 起点经度（WGS84） |
+| `start_lat` | string | 起点纬度（WGS84） |
+| `end_lng` | string | 终点经度（WGS84） |
+| `end_lat` | string | 终点纬度（WGS84） |
+| `pass_point` | string | 途经点 JSON 字符串 |
+| `max_speed` | int | 最大速度限制，`0` 表示不限制 |
+| `calc_end_point` | int/bool | 是否计算最优终点：`0` 否，`1` 是 |
+| `create_time` | int | 任务创建时间（Unix 秒） |
+| `update_time` | int | 任务更新时间（Unix 秒） |
+| `task_state` | int | 任务开关：`0` 可执行，`1` 已结束 |
+| `task_end_msg` | string | 任务结束说明 |
+| `business_type` | int | 业务类型：`1` 巡游，`2` 叫车，`3` 调度，`4` 导航 |
+| `task_stuck_timer_duration` | int | 被困判定时间（秒） |
+| `curise_id` | int | 关联巡游日志 ID，非巡游任务为 `0` |
+| `state` | int \| null | 执行状态（来自 `execution.state`，无执行记录时为 `null`） |
+| `execution` | object \| null | 执行状态详情，见下表 |
+| `response` | object \| null | 规划应答详情，见下表 |
+
+#### `task.execution`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | int | 执行记录主键 |
+| `task_id` | int | 关联任务 ID |
+| `state` | int | `0` 待执行，`1` 执行中，`2` 车辆受困，`3` 完成，`4` 关闭 |
+| `task_stuck_b_time` | int | 车辆被困开始时间（Unix 秒） |
+| `trajectory_progress` | string/decimal | 轨迹执行进度 `[0.0, 1.0]` |
+| `remain_distance_m` | string/decimal | 剩余轨迹距离（米） |
+| `create_time` | int | 记录创建时间（Unix 秒） |
+
+#### `task.response`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | int | 应答记录主键 |
+| `task_id` | int | 关联任务 ID |
+| `angle_point` | string | 规划路径点（WGS84），JSON 数组：`["lon,lat,pose", ...]` |
+| `angle_point_gcj` | string | 规划路径点（GCJ02），格式同上；异步转换写入，可能为空 |
+| `dist_total` | string/decimal | 路径总距离 |
+| `use_time` | int | 预计用时（秒） |
+| `plan_state` | int/bool | 规划结果：`0` 失败，`1` 成功 |
+| `error_msg` | string | 规划失败原因 |
+| `plan_time` | int | 规划耗时 |
+
+### `error_codes[]` 元素
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | int | 记录主键 |
+| `error_codes` | string | 错误码内容（文本，具体格式由上报方定义） |
+| `create_time` | int | 记录时间（Unix 秒） |
+
+### `point` 对象
+
+来源：`vehile_pos` 最新一条，含 WGS84 与 GCJ02。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `lng` | string | 经度 WGS84 |
+| `lat` | string | 纬度 WGS84 |
+| `g_lng` | string | 经度 GCJ02 |
+| `g_lat` | string | 纬度 GCJ02 |
+| `alt` | float | 海拔 |
+| `pose` | string | 姿态角（与正北夹角，度） |
+| `global_quality` | int | 定位质量：`0` 很好，`1` 好，`2` 一般，`3` 差 |
+| `rtk_state` | int | RTK 状态：`4` 固定解/质量好，`1` 其他 |
+| `rtk_state_msg` | string | 定位质量中文描述 |
+| `is_on_way` | int | 是否在路网：`-1` 未知，`0` 不在，`1` 在 |
+| `create_time` | int | 定位点时间（Unix 秒） |
+
+### 广播示例
+
+```json
+{
+  "time": 1751780000,
+  "task": {
+    "id": 12,
+    "mqtt_id": 10086,
+    "start_lng": "120.12345678",
+    "start_lat": "30.12345678",
+    "end_lng": "120.22345678",
+    "end_lat": "30.22345678",
+    "task_state": 0,
+    "business_type": 4,
+    "state": 1,
+    "execution": { "state": 1, "trajectory_progress": "0.35", "remain_distance_m": "120.50" },
+    "response": { "plan_state": 1, "angle_point": "[\"120.12,30.12,90.00\"]", "angle_point_gcj": "" }
+  },
+  "error_codes": [
+    { "id": 5, "error_codes": "E001", "create_time": 1751779900 }
+  ],
+  "point": {
+    "lng": "120.12345678",
+    "lat": "30.12345678",
+    "g_lng": "120.12890123",
+    "g_lat": "30.12765432",
+    "pose": "90.00",
+    "global_quality": 0,
+    "rtk_state": 4,
+    "rtk_state_msg": "质量很好",
+    "is_on_way": 1,
+    "create_time": 1751780000
+  }
+}
+```
+
+---
+
+## 二、客户端指令（Client → Server）
+
+发送 JSON 文本，必须包含 `type` 字段。
+
+### `taskTimerStart` — 启动自动建任务定时器
+
+当最后一条任务已结束（`task_state=1`，或 `execution.state` 为 `3`/`4`）时，每 **3 秒**自动创建一条导航任务（`business_type=4`）。
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `type` | string | 是 | 固定值 `taskTimerStart` |
+| `calc_end_point` | int/bool | 否 | `1` 时启用最优终点计算；未传 `end_points` 时终点暂用当前位置 |
+| `end_points` | array | 否 | 终点池，每次随机选一个；与 `calc_end_point` 二选一至少配置一种 |
+
+`end_points` 元素格式（二选一）：
+
+| 格式 | 示例 |
+|---|---|
+| 字符串 `"经度,纬度"` | `"120.123,30.456"` |
+| 对象 | `{ "lng": "120.123", "lat": "30.456" }` 或 `{ "0": "120.123", "1": "30.456" }` |
+
+请求示例：
+
+```json
+{
+  "type": "taskTimerStart",
+  "calc_end_point": 0,
+  "end_points": ["120.1,30.2", "120.2,30.3"]
+}
+```
+
+### `taskTimerEnd` — 停止自动建任务定时器
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `type` | string | 是 | 固定值 `taskTimerEnd` |
+
+```json
+{ "type": "taskTimerEnd" }
+```
+
+---
+
+## 三、服务端应答（Server → Client）
+
+指令类消息由**当前连接**单独应答；定时器异常由**所有连接**广播。
+
+### 成功 `ok`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | 固定值 `ok` |
+| `msg` | string | 提示文案 |
+
+```json
+{ "type": "ok", "msg": "任务定时器已启动" }
+```
+
+### 失败 `error`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | 固定值 `error` |
+| `msg` | string | 错误说明 |
+
+触发场景：
+
+- 未知 `type`
+- 指令处理异常
+- 任务定时器运行异常（广播给全部客户端）
+
+```json
+{ "type": "error", "msg": "未知类型" }
+```
+
+---
+
+## 四、注意事项
+
+1. **广播与指令分离**：每秒广播为全量状态快照；`ok`/`error` 仅针对客户端下发的控制指令。
+2. **任务定时器**仅影响 WebSocket 进程内自动建任务，与 MQTT 下发任务相互独立。
+3. **`angle_point`** 为 WGS84；**`angle_point_gcj`** 由后台异步转换，广播中可能暂时为空。
+4. 无连接时不产生广播流量；有连接后恢复 1 秒周期推送。
